@@ -1,0 +1,94 @@
+/*
+  Layout Component Styles
+  Main application layout with header, sidebar, and content areas
+*/
+
+.layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--color-bg-primary);
+}
+
+/* Main Content Area */
+.layout__main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.layout__content {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--color-bg-primary);
+  transition: margin-left var(--duration-300) var(--ease-out);
+}
+
+.layout__content--with-sidebar {
+  margin-left: 0;
+}
+
+/* Content Scrolling */
+.layout__content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.layout__content::-webkit-scrollbar-track {
+  background: var(--color-bg-secondary);
+}
+
+.layout__content::-webkit-scrollbar-thumb {
+  background: var(--color-neutral-300);
+  border-radius: var(--radius-full);
+}
+
+.layout__content::-webkit-scrollbar-thumb:hover {
+  background: var(--color-neutral-400);
+}
+
+/* Responsive Layout */
+@media (max-width: 1024px) {
+  .layout__main {
+    flex-direction: column;
+  }
+  
+  .layout__content--with-sidebar {
+    margin-left: 0;
+  }
+}
+
+/* Mobile Layout */
+@media (max-width: 768px) {
+  .layout {
+    flex-direction: column;
+  }
+  
+  .layout__main {
+    flex-direction: column;
+    overflow: visible;
+  }
+  
+  .layout__content {
+    overflow-y: visible;
+  }
+}
+
+/* Focus Management */
+.layout__content:focus {
+  outline: none;
+}
+
+/* Print Styles */
+@media print {
+  .layout {
+    flex-direction: column;
+  }
+  
+  .layout__main {
+    flex-direction: column;
+  }
+  
+  .layout__content {
+    overflow: visible;
+  }
+}

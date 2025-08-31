@@ -1,0 +1,149 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: agentic_pdf_sage_db
+    environment:
+      POSTGRES_DB: agentsage
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Ollama LLM Server (Free Local LLM)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agentic_pdf_sage_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - app-network
+    restart: unless-stopped
+    environment:
+      - OLLAMA_ORIGINS=*
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          memory: 2G
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agentic_pdf_sage_backend
+    environment:
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/agentsage
+      FRONTEND_HOST: ${FRONTEND_HOST}
+      OLLAMA_HOST: ${OLLAMA_HOST}
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      LLM_MODEL: ${LLM_MODEL}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      ENVIRONMENT: ${ENVIRONMENT}
+      SECRET_KEY: ${SECRET_KEY}
+      HUGGINGFACE_TOKEN: ${HUGGINGFACE_TOKEN}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      # Add other missing variables from your .env
+      DEBUG: ${DEBUG}
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW}
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE}
+      UPLOAD_DIR: ${UPLOAD_DIR}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE}
+      MAX_TOKENS: ${MAX_TOKENS}
+      CHUNK_SIZE: ${CHUNK_SIZE}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FILE: ${LOG_FILE}
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/logs:/app/logs
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_BACKEND_URL: ${BACKEND_HOST:-http://localhost:8000}
+    container_name: agentic_pdf_sage_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Initialize Ollama with models (run once)
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama_init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: "no"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    command: >
+      sh -c "
+        echo 'Pulling Llama2 model...' &&
+        ollama pull llama2 &&
+        echo 'Pulling Mistral model...' &&
+        ollama pull mistral &&
+        echo 'Models downloaded successfully!'
+      "
+
+volumes:
+  postgres_data:
+  ollama_data:
+
+networks:
+  app-network:
+    driver: bridge
