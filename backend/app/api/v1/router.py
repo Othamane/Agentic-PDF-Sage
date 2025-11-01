@@ -4,7 +4,8 @@ Main API endpoints for the application.
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import chat, documents, health
+from app.api.v1.endpoints import health
+from app.api.v1.endpoints import enhanced_chat_endpoints, enhanced_document_endpoints
 
 # Create main API router
 api_router = APIRouter()
@@ -17,13 +18,13 @@ api_router.include_router(
 )
 
 api_router.include_router(
-    documents.router,
+    enhanced_document_endpoints.router,
     prefix="/documents",
     tags=["Documents"]
 )
 
 api_router.include_router(
-    chat.router,
+    enhanced_chat_endpoints.router,
     prefix="/chat",
     tags=["Chat"]
 )

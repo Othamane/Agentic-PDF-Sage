@@ -27,7 +27,7 @@ const Header = () => {
             <Bot size={24} />
           </div>
           <div className="header__logo-text">
-            <span className="header__logo-title">Agentic PDF Sage</span>
+            <span className="header__logo-title">PDF Sage</span>
             <span className="header__logo-subtitle">Intelligent Document Assistant</span>
           </div>
         </Link>

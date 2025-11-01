@@ -1,7 +1,6 @@
 """
-Document processing service for PDF files.
-Handles upload, text extraction, and vector store creation.
-Fixed with proper database session management and error handling.
+Enhanced document processing service with proper status handling.
+Fixes status inconsistency and session management issues.
 """
 
 import asyncio
@@ -16,22 +15,23 @@ from typing import Dict, Any, Optional, List, BinaryIO
 
 import PyPDF2
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, select, update
+from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.core.database import get_db_session, create_db_session
 from app.models.document import Document, DocumentStatus
-from app.services.vector_service import vector_service
-from app.services.free_llm_service import free_llm_service
-
+from app.services.enhanced_vector_service import enhanced_vector_service
+from app.services.gemini_llm_service import improved_llm_service
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-class DocumentService:
+class EnhancedDocumentService:
     """
-    Service for managing document upload, processing, and storage.
+    Enhanced service for managing document upload, processing, and storage.
+    Fixes status consistency and improves session management.
     """
     
     def __init__(self):
@@ -39,9 +39,15 @@ class DocumentService:
         self.upload_dir = Path(settings.UPLOAD_DIR)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         
+        # Add vector service reference
+        self.vector_service = enhanced_vector_service
+        
         # Allowed file extensions
         self.allowed_extensions = {'.pdf'}
         self.max_file_size = settings.MAX_FILE_SIZE
+        
+        # Processing status lock to prevent race conditions
+        self._processing_locks = {}
     
     async def upload_document(
         self,
@@ -52,18 +58,9 @@ class DocumentService:
         user_id: Optional[str] = None
     ) -> Document:
         """
-        Upload and process a document.
-        
-        Args:
-            file: File object to upload
-            filename: Original filename
-            title: Optional document title
-            description: Optional document description
-            user_id: Optional user identifier
-        
-        Returns:
-            Document model instance
+        Upload and process a document with proper status management.
         """
+        document = None
         try:
             # Validate file
             await self._validate_file(file, filename)
@@ -74,17 +71,17 @@ class DocumentService:
             
             # Check for existing document with same hash
             async with get_db_session() as db:
-                result = await db.execute(
-                    text("SELECT * FROM documents WHERE file_hash = :hash"),
-                    {"hash": file_hash}
-                )
-                if result.first():
+                stmt = select(Document).where(Document.file_hash == file_hash)
+                result = await db.execute(stmt)
+                existing_doc = result.scalar_one_or_none()
+                
+                if existing_doc:
                     raise ValueError("Document with identical content already exists")
             
             # Save file to storage
             storage_path = await self._save_file(file_content, filename, file_hash)
             
-            # Create document record
+            # Create document record with explicit status
             document = Document(
                 filename=filename,
                 title=title or self._extract_title_from_filename(filename),
@@ -92,41 +89,57 @@ class DocumentService:
                 file_size=len(file_content),
                 file_hash=file_hash,
                 storage_path=str(storage_path),
-                status=DocumentStatus.UPLOADED,
+                status=DocumentStatus.UPLOADED,  # Explicit enum value
                 user_id=user_id
             )
             
-            # Save to database
+            # Save to database with proper session handling
             async with get_db_session() as db:
                 db.add(document)
-                await db.flush()  # Get the ID
-                await db.refresh(document)  # Refresh to get all fields
+                await db.flush()  # Get the ID without committing
+                
+                # Refresh to get all fields
+                await db.refresh(document)
+                
+                # Log the initial status
+                logger.info(f"Document {document.id} created with status: {document.status}")
+                
+                # Commit the transaction
+                await db.commit()
             
-            # Start background processing
+            # Start background processing (non-blocking)
             asyncio.create_task(self._process_document_async(str(document.id)))
             
             logger.info(f"Document uploaded successfully: {document.id}")
             return document
             
-            raise
         except Exception as e:
-            logger.error(f"Document upload failed: {e}")
+            logger.error(f"Document upload failed: {e}", exc_info=True)
+            
+            # Clean up file if document creation failed
+            if document is None and 'storage_path' in locals():
+                try:
+                    if os.path.exists(storage_path):
+                        os.remove(storage_path)
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean up file: {cleanup_error}")
+            
             raise
     
     async def get_document(self, document_id: str) -> Optional[Document]:
-        """Get document by ID."""
+        """Get document by ID with proper session handling."""
         try:
             async with get_db_session() as db:
-                result = await db.execute(
-                    text("SELECT * FROM documents WHERE id = :id"),
-                    {"id": document_id}
-                )
-                row = result.first()
-                if row:
-                    # Convert row to dict and create Document instance
-                    doc_data = dict(row._mapping)
-                    return Document(**doc_data)
-                return None
+                # Use select with explicit ID conversion
+                stmt = select(Document).where(Document.id == document_id)
+                result = await db.execute(stmt)
+                document = result.scalar_one_or_none()
+                
+                if document:
+                    # Ensure status is properly loaded
+                    logger.debug(f"Retrieved document {document_id} with status: {document.status}")
+                
+                return document
                 
         except Exception as e:
             logger.error(f"Failed to get document {document_id}: {e}")
@@ -139,59 +152,101 @@ class DocumentService:
         limit: int = 50,
         offset: int = 0
     ) -> List[Document]:
-        """List documents with optional filtering."""
+        """List documents with proper status handling."""
         try:
-            query = "SELECT * FROM documents WHERE 1=1"
-            params = {}
-            
-            if user_id:
-                query += " AND user_id = :user_id"
-                params["user_id"] = user_id
-            
-            if status:
-                query += " AND status = :status"
-                params["status"] = status.value
-            
-            query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
-            params.update({"limit": limit, "offset": offset})
-            
             async with get_db_session() as db:
-                result = await db.execute(text(query), params)
-                rows = result.fetchall()
-                return [Document(**dict(row._mapping)) for row in rows]
+                # Build query with SQLAlchemy select
+                stmt = select(Document)
+                
+                # Add filters
+                if user_id:
+                    stmt = stmt.where(Document.user_id == user_id)
+                
+                if status:
+                    stmt = stmt.where(Document.status == status)
+                
+                # Add ordering and pagination
+                stmt = stmt.order_by(Document.created_at.desc()).limit(limit).offset(offset)
+                
+                result = await db.execute(stmt)
+                documents = result.scalars().all()
+                
+                # Log status for debugging
+                for doc in documents:
+                    logger.debug(f"Document {doc.id} status: {doc.status}")
+                
+                return list(documents)
                 
         except Exception as e:
             logger.error(f"Failed to list documents: {e}")
             return []
+    
+    async def update_document_status(
+        self,
+        document_id: str,
+        status: DocumentStatus,
+        error_message: Optional[str] = None
+    ) -> bool:
+        """
+        Update document status with proper transaction handling.
+        """
+        try:
+            async with get_db_session() as db:
+                # Use update statement for atomic operation
+                stmt = update(Document).where(Document.id == document_id)
+                
+                update_data = {
+                    "status": status,
+                    "updated_at": datetime.utcnow()
+                }
+                
+                if status == DocumentStatus.PROCESSING:
+                    update_data["processing_started_at"] = datetime.utcnow()
+                    update_data["processing_error"] = None
+                elif status == DocumentStatus.PROCESSED:
+                    update_data["processing_completed_at"] = datetime.utcnow()
+                    update_data["processing_error"] = None
+                elif status == DocumentStatus.FAILED:
+                    update_data["processing_completed_at"] = datetime.utcnow()
+                    update_data["processing_error"] = error_message
+                
+                stmt = stmt.values(**update_data)
+                
+                result = await db.execute(stmt)
+                await db.commit()
+                
+                if result.rowcount > 0:
+                    logger.info(f"Updated document {document_id} status to {status.value}")
+                    return True
+                else:
+                    logger.warning(f"No document found with ID {document_id} for status update")
+                    return False
+                
+        except Exception as e:
+            logger.error(f"Failed to update document status {document_id}: {e}")
+            return False
     
     async def delete_document(self, document_id: str) -> bool:
         """Delete a document and its associated data."""
         try:
             async with get_db_session() as db:
                 # Get document
-                result = await db.execute(
-                    text("SELECT * FROM documents WHERE id = :id"),
-                    {"id": document_id}
-                )
-                row = result.first()
-                if not row:
+                stmt = select(Document).where(Document.id == document_id)
+                result = await db.execute(stmt)
+                document = result.scalar_one_or_none()
+                
+                if not document:
                     return False
                 
-                doc_data = dict(row._mapping)
-                document = Document(**doc_data)
-                
                 # Delete vector store
-                await vector_service.delete_vector_store(document_id)
+                await enhanced_vector_service.delete_vector_store(document_id)
                 
                 # Delete physical file
                 if os.path.exists(document.storage_path):
                     os.remove(document.storage_path)
                 
-                # Update document status
-                await db.execute(
-                    text("UPDATE documents SET status = :status WHERE id = :id"),
-                    {"status": DocumentStatus.DELETED.value, "id": document_id}
-                )
+                # Update document status to deleted
+                await self.update_document_status(document_id, DocumentStatus.DELETED)
             
             logger.info(f"Document deleted successfully: {document_id}")
             return True
@@ -219,7 +274,7 @@ class DocumentService:
         document_ids: Optional[List[str]] = None,
         k: int = 10
     ) -> List[Dict[str, Any]]:
-        """Search across documents using vector similarity."""
+        """Search across documents using enhanced vector similarity."""
         try:
             if not document_ids:
                 # Get all processed documents
@@ -227,10 +282,13 @@ class DocumentService:
                 document_ids = [str(doc.id) for doc in documents]
             
             if not document_ids:
+                logger.warning("No processed documents found for search")
                 return []
             
-            # Search using vector service
-            similar_chunks = await vector_service.search_similar(
+            logger.info(f"Searching {len(document_ids)} documents for: '{query[:100]}...'")
+            
+            # Search using enhanced vector service
+            similar_chunks = await enhanced_vector_service.search_similar(
                 document_ids=document_ids,
                 query=query,
                 k=k
@@ -247,13 +305,14 @@ class DocumentService:
                     "metadata": chunk.metadata
                 })
             
+            logger.info(f"Search returned {len(results)} results")
             return results
             
         except Exception as e:
-            logger.error(f"Document search failed: {e}")
+            logger.error(f"Document search failed: {e}", exc_info=True)
             return []
     
-    # Private helper methods
+    # Private helper methods - enhanced versions
     
     async def _validate_file(self, file: BinaryIO, filename: str):
         """Validate uploaded file."""
@@ -285,7 +344,7 @@ class DocumentService:
     
     async def _save_file(self, content: bytes, filename: str, file_hash: str) -> Path:
         """Save file to storage."""
-        # Create subdirectory based on hash prefix for better distribution
+        # Create subdirectory based on hash prefix
         subdir = self.upload_dir / file_hash[:2]
         subdir.mkdir(exist_ok=True)
         
@@ -304,26 +363,29 @@ class DocumentService:
         return Path(filename).stem.replace('_', ' ').replace('-', ' ').title()
     
     async def _process_document_async(self, document_id: str):
-        """Process document in background with proper session management."""
-        db_session = None
+        """
+        Process document in background with proper status management and session handling.
+        """
+        # Prevent multiple processing of the same document
+        if document_id in self._processing_locks:
+            logger.warning(f"Document {document_id} is already being processed")
+            return
+        
+        self._processing_locks[document_id] = True
+        
         try:
             logger.info(f"Starting document processing: {document_id}")
             
-            # Create a dedicated session for this background task
-            db_session = await create_db_session()
-            
             # Update status to processing
-            await db_session.execute(
-                text("UPDATE documents SET status = :status, processing_started_at = :started_at WHERE id = :id"),
-                {
-                    "status": DocumentStatus.PROCESSING.value,
-                    "started_at": datetime.utcnow(),
-                    "id": document_id
-                }
+            success = await self.update_document_status(
+                document_id, 
+                DocumentStatus.PROCESSING
             )
-            await db_session.commit()
             
-            # Get document
+            if not success:
+                raise Exception("Failed to update document status to processing")
+            
+            # Get document with fresh session
             document = await self.get_document(document_id)
             if not document:
                 raise Exception("Document not found")
@@ -338,7 +400,7 @@ class DocumentService:
             page_count = await self._count_pdf_pages(document.storage_path)
             word_count = len(extracted_text.split())
             
-            # Generate summary using free LLM
+            # Generate summary using Gemini
             try:
                 summary = await asyncio.wait_for(
                     self._generate_summary(extracted_text), 
@@ -354,10 +416,10 @@ class DocumentService:
             # Extract keywords
             keywords = await self._extract_keywords(extracted_text)
             
-            # Create vector store
+            # Create vector store with enhanced service
             try:
                 vector_store_path = await asyncio.wait_for(
-                    vector_service.create_vector_store(
+                    enhanced_vector_service.create_vector_store(
                         document_id=document_id,
                         text_content=extracted_text,
                         metadata={
@@ -366,71 +428,50 @@ class DocumentService:
                             "page_count": page_count
                         }
                     ),
-                    timeout=300.0  # 5 minutes timeout for vector creation
+                    timeout=300.0  # 5 minutes timeout
                 )
             except asyncio.TimeoutError:
                 raise Exception("Vector store creation timed out")
             
             # Get vector store stats
-            vector_stats = await vector_service.get_vector_store_stats(document_id)
+            vector_stats = await enhanced_vector_service.get_vector_store_stats(document_id)
             chunk_count = vector_stats.get("total_chunks", 0)
             
-            # Update document with extracted information
-            await db_session.execute(text("""
-                UPDATE documents SET 
-                    status = :status,
-                    processing_completed_at = :completed_at,
-                    extracted_text = :extracted_text,
-                    page_count = :page_count,
-                    word_count = :word_count,
-                    chunk_count = :chunk_count,
-                    summary = :summary,
-                    keywords = :keywords,
-                    vector_store_path = :vector_store_path,
-                    embedding_model = :embedding_model
-                WHERE id = :id
-            """), {
-                "status": DocumentStatus.PROCESSED.value,
-                "completed_at": datetime.utcnow(),
-                "extracted_text": extracted_text,
-                "page_count": page_count,
-                "word_count": word_count,
-                "chunk_count": chunk_count,
-                "summary": summary,
-                "keywords": ",".join(keywords),
-                "vector_store_path": vector_store_path,
-                "embedding_model": settings.EMBEDDING_MODEL,
-                "id": document_id
-            })
-            await db_session.commit()
+            # Update document with all extracted information
+            async with get_db_session() as db:
+                stmt = update(Document).where(Document.id == document_id).values(
+                    status=DocumentStatus.PROCESSED,
+                    processing_completed_at=datetime.utcnow(),
+                    extracted_text=extracted_text,
+                    page_count=page_count,
+                    word_count=word_count,
+                    chunk_count=chunk_count,
+                    summary=summary,
+                    keywords=",".join(keywords),
+                    vector_store_path=vector_store_path,
+                    embedding_model=settings.EMBEDDING_MODEL,
+                    updated_at=datetime.utcnow()
+                )
+                
+                await db.execute(stmt)
+                await db.commit()
             
-            logger.info(f"Document processing completed: {document_id}")
+            logger.info(f"Document processing completed successfully: {document_id}")
             
         except Exception as e:
-            logger.error(f"Document processing failed for {document_id}: {e}")
+            logger.error(f"Document processing failed for {document_id}: {e}", exc_info=True)
             
             # Update status to failed
-            if db_session:
-                try:
-                    await db_session.execute(text("""
-                        UPDATE documents SET 
-                            status = :status,
-                            processing_completed_at = :completed_at,
-                            processing_error = :error
-                        WHERE id = :id
-                    """), {
-                        "status": DocumentStatus.FAILED.value,
-                        "completed_at": datetime.utcnow(),
-                        "error": str(e)[:1000],  # Limit error message length
-                        "id": document_id
-                    })
-                    await db_session.commit()
-                except Exception as commit_error:
-                    logger.error(f"Failed to update error status: {commit_error}")
+            await self.update_document_status(
+                document_id, 
+                DocumentStatus.FAILED, 
+                str(e)[:1000]
+            )
         
         finally:
-            if db_session:
-                await db_session.close()
+            # Remove processing lock
+            if document_id in self._processing_locks:
+                del self._processing_locks[document_id]
     
     async def _extract_pdf_text(self, file_path: str) -> str:
         """Extract text from PDF file."""
@@ -470,20 +511,20 @@ class DocumentService:
         return await loop.run_in_executor(None, _count)
     
     async def _generate_summary(self, text: str, max_length: int = 500) -> str:
-        """Generate document summary using free LLM."""
+        """Generate document summary using Gemini."""
         try:
             # Limit input text for summarization
-            max_input = 4000  # Conservative limit for free models
+            max_input = 8000  # Gemini can handle more
             if len(text) > max_input:
                 text = text[:max_input] + "..."
             
-            prompt = f"""Please provide a concise summary of the following document in about 2-3 sentences:
+            prompt = f"""Please provide a concise summary of the following document in 2-3 sentences:
 
 {text}
 
 Summary:"""
             
-            summary = await free_llm_service.generate_response(
+            summary = await improved_llm_service.generate_response(
                 prompt, 
                 max_tokens=200
             )
@@ -503,7 +544,6 @@ Summary:"""
         """Extract keywords from document text."""
         try:
             # Simple keyword extraction using word frequency
-            # In production, could use more sophisticated NLP
             import re
             from collections import Counter
             
@@ -543,5 +583,5 @@ Summary:"""
             return []
 
 
-# Global document service instance
-document_service = DocumentService()
+# Global enhanced document service instance
+enhanced_document_service = EnhancedDocumentService()

@@ -1,20 +1,17 @@
 """
-Free LLM service using Ollama and HuggingFace transformers.
-No paid APIs required - fully open source solution.
-Fixed with better error handling and provider management.
+Gemini LLM service using Google's Gemini API.
+High-performance replacement for Ollama with better reliability.
 """
 
 import asyncio
 import logging
-import requests
-import json
 import time
 from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
+import torch
 
 from app.core.config import get_settings
 
@@ -35,66 +32,106 @@ class BaseLLMProvider(ABC):
         """Check if LLM is available."""
         pass
 
-
-class OllamaProvider(BaseLLMProvider):
+class GeminiProvider(BaseLLMProvider):
     """
-    Ollama LLM provider - completely free local LLM.
-    Supports Llama2, Mistral, CodeLlama, and many others.
+    Google Gemini API provider - fast and reliable.
     """
     
-    def __init__(self, host: str = None, model: str = None):
-        self.host = host or settings.OLLAMA_HOST
-        self.model = model or settings.LLM_MODEL
-        self.session = requests.Session()
+    def __init__(self, api_key: str = None, model_name: str = None):
+        self.api_key = api_key or settings.GEMINI_API_KEY
+        self.model_name = model_name or settings.LLM_MODEL
+        self._model = None
+        self._initialized = False
         self._last_health_check = 0
         self._health_check_interval = 300  # 5 minutes
         self._is_healthy = None
         
-    async def generate_response(self, prompt: str, max_tokens: int = None) -> str:
-        """Generate response using Ollama."""
+        logger.info(f"Initializing Gemini with model: {self.model_name}")
+        
+        # Configure Gemini
+        if self.api_key:
+            genai.configure(api_key=self.api_key)
+            logger.info("Gemini API configured successfully")
+        else:
+            logger.warning("No Gemini API key found")
+    
+    async def _initialize(self):
+        """Initialize the Gemini model."""
+        if self._initialized:
+            return
+            
         try:
-            url = f"{self.host}/api/generate"
-            
-            payload = {
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": settings.LLM_TEMPERATURE,
-                    "num_predict": max_tokens or settings.MAX_TOKENS,
-                    "top_p": 0.9,
-                    "top_k": 40
-                }
-            }
-            
-            # Use asyncio to run the blocking request
-            loop = asyncio.get_event_loop()
-            headers = {"Content-Type": "application/json"}
-            response = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, 
-                    lambda: self.session.post(url, json=payload, headers=headers,timeout=120)
-                ),
-                timeout=150.0  # Slightly longer than request timeout
+            if not self.api_key:
+                raise Exception("GEMINI_API_KEY not found in settings")
+                
+            # Initialize the model
+            generation_config = genai.types.GenerationConfig(
+                temperature=settings.LLM_TEMPERATURE,
+                max_output_tokens=settings.MAX_TOKENS,
+                top_p=0.95,
+                top_k=40
             )
             
-            if response.status_code == 200:
-                result = response.json()
-                return result.get("response", "").strip()
-            else:
-                logger.error(f"Ollama API error: {response.status_code} - {response.text}")
-                raise Exception(f"Ollama API error: {response.status_code}")
-                
-        except asyncio.TimeoutError:
-            logger.error("Ollama generation timed out")
-            raise Exception("Ollama generation timed out")
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            ]
+            
+            self._model = genai.GenerativeModel(
+                model_name=self.model_name,
+                generation_config=generation_config,
+                safety_settings=safety_settings
+            )
+            
+            self._initialized = True
+            logger.info(f"Gemini model {self.model_name} initialized successfully")
+            
         except Exception as e:
-            logger.error(f"Ollama generation error: {e}")
-            self._is_healthy = False  # Mark as unhealthy on error
+            logger.error(f"Failed to initialize Gemini model: {e}")
             raise
     
+    async def generate_response(self, prompt: str, max_tokens: int = None) -> str:
+        """Generate response using Gemini API."""
+        await self._initialize()
+        
+        try:
+            # Validate and truncate prompt if needed
+            if not prompt or not prompt.strip():
+                return "I need a question or prompt to respond to."
+            
+            if len(prompt) > 30000:
+                prompt = prompt[:30000] + "..."
+                logger.warning("Prompt truncated due to length")
+            
+            # Generate response
+            loop = asyncio.get_event_loop()
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self._model.generate_content(prompt)
+                ),
+                timeout=30.0
+            )
+            
+            # Extract text from response
+            if response.parts:
+                return response.text.strip()
+            else:
+                logger.warning("Gemini returned empty response")
+                return "I'm sorry, I couldn't generate a response to that question."
+                
+        except asyncio.TimeoutError:
+            logger.error("Gemini generation timed out")
+            return "Response generation timed out. Please try again."
+        except Exception as e:
+            logger.error(f"Gemini generation error: {e}")
+            self._is_healthy = False
+            return f"I encountered an error generating a response: {str(e)[:100]}"
+    
     async def is_available(self) -> bool:
-        """Check if Ollama is running and model is available."""
+        """Check if Gemini API is available."""
         current_time = time.time()
         
         # Use cached result if recent
@@ -103,26 +140,15 @@ class OllamaProvider(BaseLLMProvider):
             return self._is_healthy
         
         try:
-            # Check if Ollama is running
-            url = f"{self.host}/api/tags"
-            loop = asyncio.get_event_loop()
-            response = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: self.session.get(url, timeout=10)
-                ),
+            await self._initialize()
+            
+            # Test with a simple prompt
+            test_response = await asyncio.wait_for(
+                self.generate_response("Hello", max_tokens=10),
                 timeout=15.0
             )
             
-            if response.status_code != 200:
-                self._is_healthy = False
-                return False
-            
-            # Check if our model is available
-            models = response.json().get("models", [])
-            model_names = [model.get("name", "") for model in models]
-            
-            is_available = any(self.model in name for name in model_names)
+            is_available = len(test_response) > 0 and "error" not in test_response.lower()
             
             # Update cache
             self._is_healthy = is_available
@@ -131,22 +157,17 @@ class OllamaProvider(BaseLLMProvider):
             return is_available
             
         except Exception as e:
-            logger.warning(f"Ollama availability check failed: {e}")
+            logger.warning(f"Gemini availability check failed: {e}")
             self._is_healthy = False
             self._last_health_check = current_time
             return False
-
-
 class HuggingFaceProvider(BaseLLMProvider):
     """
-    HuggingFace transformers provider - free local inference.
-    Uses smaller models that can run on CPU.
+    HuggingFace transformers provider - free local inference fallback.
     """
     
-    def __init__(self, model_name: str = None):
-        self.model_name = model_name or "microsoft/DialoGPT-medium"
-        self.tokenizer = None
-        self.model = None
+    def __init__(self, model_name: str = "microsoft/DialoGPT-medium"):
+        self.model_name = model_name
         self.pipeline = None
         self._initialized = False
         self._initialization_error = None
@@ -162,10 +183,10 @@ class HuggingFaceProvider(BaseLLMProvider):
         try:
             logger.info(f"Loading HuggingFace model: {self.model_name}")
             
-            # Use CPU for compatibility (can be changed to GPU if available)
+            from transformers import pipeline
+            
             device = 0 if torch.cuda.is_available() else -1
             
-            # Initialize text generation pipeline
             loop = asyncio.get_event_loop()
             self.pipeline = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -175,7 +196,7 @@ class HuggingFaceProvider(BaseLLMProvider):
                         model=self.model_name,
                         device=device,
                         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                        trust_remote_code=True  # Allow custom model code
+                        trust_remote_code=True
                     )
                 ),
                 timeout=300.0  # 5 minutes for model loading
@@ -211,14 +232,12 @@ class HuggingFaceProvider(BaseLLMProvider):
                         truncation=True
                     )
                 ),
-                timeout=60.0  # 1 minute timeout for generation
+                timeout=60.0
             )
             
-            # Extract generated text (remove the input prompt)
             generated_text = result[0]["generated_text"]
             response = generated_text[len(prompt):].strip()
             
-            # Fallback if response is empty
             if not response:
                 return "I understand your question, but I'm unable to generate a meaningful response at this time."
             
@@ -240,9 +259,9 @@ class HuggingFaceProvider(BaseLLMProvider):
             return False
 
 
-class FreeLLMService:
+class ImprovedLLMService:
     """
-    Service that manages free LLM providers with fallback support.
+    Enhanced LLM service with Gemini as primary provider and HF as fallback.
     """
     
     def __init__(self):
@@ -255,10 +274,10 @@ class FreeLLMService:
     def _setup_providers(self):
         """Setup available LLM providers in order of preference."""
         
-        # Add Ollama provider (best performance, requires Ollama running)
-        self.providers.append(OllamaProvider())
+        # Add Gemini provider (best performance and reliability)
+        self.providers.append(GeminiProvider())
         
-        # Add HuggingFace provider (fallback, always works but slower)
+        # Add HuggingFace provider (fallback)
         self.providers.append(HuggingFaceProvider())
         
     async def _find_available_provider(self) -> Optional[BaseLLMProvider]:
@@ -268,7 +287,7 @@ class FreeLLMService:
         for provider in self.providers:
             provider_name = provider.__class__.__name__
             
-            # Skip recently failed providers (except if it's been a while)
+            # Skip recently failed providers
             last_check = self.provider_last_check.get(provider_name, 0)
             if current_time - last_check < 60:  # 1 minute cooldown
                 continue
@@ -276,7 +295,7 @@ class FreeLLMService:
             try:
                 is_available = await asyncio.wait_for(
                     provider.is_available(),
-                    timeout=30.0  # 30 seconds timeout for availability check
+                    timeout=30.0
                 )
                 
                 self.provider_last_check[provider_name] = current_time
@@ -295,16 +314,13 @@ class FreeLLMService:
         return None
     
     async def generate_response(self, prompt: str, max_tokens: int = None) -> str:
-        """
-        Generate response using the first available provider.
-        """
-        # Validate input
+        """Generate response using the first available provider."""
         if not prompt or not prompt.strip():
             return "I need a question or prompt to respond to."
         
         # Truncate very long prompts
-        if len(prompt) > 8000:
-            prompt = prompt[:8000] + "..."
+        if len(prompt) > 30000:
+            prompt = prompt[:30000] + "..."
             logger.warning("Prompt truncated due to length")
         
         # Check current provider first
@@ -320,11 +336,10 @@ class FreeLLMService:
         
         if not self.current_provider:
             error_msg = """No LLM providers are available. Please ensure:
-1. Ollama is installed and running with models downloaded, OR
+1. GEMINI_API_KEY is set in your environment variables, OR
 2. System has sufficient resources for HuggingFace models
 
-To install Ollama: visit https://ollama.ai
-To download models: run 'ollama pull llama2'"""
+To get a Gemini API key: visit https://makersuite.google.com/app/apikey"""
             
             logger.error("No LLM providers available")
             raise Exception(error_msg)
@@ -335,15 +350,11 @@ To download models: run 'ollama pull llama2'"""
         except Exception as e:
             logger.error(f"All providers failed. Last error: {e}")
             self.current_provider = None
-            
-            # Return a helpful error message instead of raising
-            return f"I'm experiencing technical difficulties with the language models. Please try again in a few moments. Error: {str(e)[:100]}"
+            return f"I'm experiencing technical difficulties. Please try again in a few moments. Error: {str(e)[:100]}"
 
-
-class FreeEmbeddingService:
+class ImprovedEmbeddingService:
     """
-    Free embedding service using sentence-transformers.
-    No API keys required.
+    Enhanced embedding service with better error handling and performance.
     """
     
     def __init__(self, model_name: str = None):
@@ -351,41 +362,57 @@ class FreeEmbeddingService:
         self.model = None
         self._initialized = False
         self._initialization_error = None
+        self._init_lock = asyncio.Lock()  # Add this to prevent concurrent initialization
         
     async def _initialize(self):
-        """Initialize the embedding model."""
-        if self._initialized:
-            return
-        
-        if self._initialization_error:
-            raise self._initialization_error
+        """Initialize the embedding model - FIXED to prevent recursion."""
+        # Use lock to prevent concurrent initialization attempts
+        async with self._init_lock:
+            if self._initialized:
+                return
             
-        try:
-            logger.info(f"Loading embedding model: {self.model_name}")
-            
-            loop = asyncio.get_event_loop()
-            self.model = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: SentenceTransformer(self.model_name)
-                ),
-                timeout=300.0  # 5 minutes for model loading
-            )
-            
-            self._initialized = True
-            logger.info("Embedding model loaded successfully")
-            
-        except Exception as e:
-            error_msg = f"Failed to initialize embedding model: {e}"
-            logger.error(error_msg)
-            self._initialization_error = Exception(error_msg)
-            raise self._initialization_error
+            if self._initialization_error:
+                raise self._initialization_error
+                
+            try:
+                logger.info(f"Loading embedding model: {self.model_name}")
+                
+                loop = asyncio.get_event_loop()
+                self.model = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: SentenceTransformer(self.model_name)
+                    ),
+                    timeout=300.0
+                )
+                
+                # FIXED: Test the model with direct sync call to prevent recursion
+                try:
+                    test_embedding = self.model.encode("test", convert_to_numpy=True)
+                    if test_embedding is None or len(test_embedding) == 0:
+                        raise Exception("Model returned empty embedding")
+                    
+                    self._initialized = True
+                    logger.info(f"Embedding model loaded successfully. Dimension: {len(test_embedding)}")
+                    
+                except Exception as test_error:
+                    raise Exception(f"Model test failed: {test_error}")
+                
+            except Exception as e:
+                error_msg = f"Failed to initialize embedding model: {e}"
+                logger.error(error_msg)
+                self._initialization_error = Exception(error_msg)
+                raise self._initialization_error
     
     async def embed_text(self, text: str) -> List[float]:
         """Generate embeddings for a single text."""
         await self._initialize()
         
         try:
+            if not text or not text.strip():
+                # Return zero vector for empty text
+                return [0.0] * 384  # Default dimension for all-MiniLM-L6-v2
+            
             # Truncate very long texts
             if len(text) > 8000:
                 text = text[:8000]
@@ -394,12 +421,16 @@ class FreeEmbeddingService:
             embedding = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda: self.model.encode(text)
+                    lambda: self.model.encode(text, convert_to_numpy=True)
                 ),
-                timeout=30.0  # 30 seconds timeout
+                timeout=30.0
             )
             
-            return embedding.tolist()
+            # Ensure we return a list
+            if hasattr(embedding, 'tolist'):
+                return embedding.tolist()
+            else:
+                return list(embedding)
             
         except asyncio.TimeoutError:
             logger.error("Embedding generation timed out")
@@ -413,23 +444,33 @@ class FreeEmbeddingService:
         await self._initialize()
         
         try:
-            # Truncate very long texts and limit batch size
+            # Process texts and limit batch size
             processed_texts = []
-            for text in texts[:100]:  # Limit to 100 texts per batch
-                if len(text) > 8000:
-                    text = text[:8000]
-                processed_texts.append(text)
+            for text in texts[:50]:  # REDUCED batch size to prevent memory issues
+                if not text or not text.strip():
+                    processed_texts.append("empty")  # Placeholder for empty text
+                elif len(text) > 8000:
+                    processed_texts.append(text[:8000])
+                else:
+                    processed_texts.append(text)
+            
+            if not processed_texts:
+                return []
             
             loop = asyncio.get_event_loop()
             embeddings = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda: self.model.encode(processed_texts)
+                    lambda: self.model.encode(processed_texts, convert_to_numpy=True)
                 ),
-                timeout=min(60.0, len(processed_texts) * 2.0)  # Dynamic timeout
+                timeout=min(120.0, len(processed_texts) * 3.0)  # More generous timeout
             )
             
-            return embeddings.tolist()
+            # Convert to list format
+            if hasattr(embeddings, 'tolist'):
+                return embeddings.tolist()
+            else:
+                return [list(emb) for emb in embeddings]
             
         except asyncio.TimeoutError:
             logger.error("Batch embedding generation timed out")
@@ -441,12 +482,11 @@ class FreeEmbeddingService:
     async def is_available(self) -> bool:
         """Check if embedding model is available."""
         try:
-            await asyncio.wait_for(self._initialize(), timeout=10.0)
+            await asyncio.wait_for(self._initialize(), timeout=30.0)  # Increased timeout
             return self._initialized
-        except Exception:
+        except Exception as e:
+            logger.error(f"Embedding availability check failed: {e}")
             return False
-
-
 # Global instances
-free_llm_service = FreeLLMService()
-free_embedding_service = FreeEmbeddingService()
+improved_llm_service = ImprovedLLMService()
+improved_embedding_service = ImprovedEmbeddingService()

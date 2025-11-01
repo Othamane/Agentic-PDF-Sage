@@ -16,7 +16,7 @@ from sqlalchemy import Enum as SQLEnum
 from app.core.database import Base
 
 
-class DocumentStatus(Enum):
+class DocumentStatus(Enum): 
     """Enumeration of document processing statuses."""
     UPLOADED = "uploaded"
     PROCESSING = "processing"
@@ -89,10 +89,10 @@ class Document(Base):
     )
     
     # Processing status - FIXED: Use lowercase default
-    status = Column(
-        SQLEnum(DocumentStatus, values_callable=lambda obj: [e.value for e in obj]),
+    status = Column( 
+        SQLEnum(DocumentStatus, name='document_status' , values_callable=lambda x: [e.value for e in x]),
         nullable=False,
-        default="uploaded",  # Use string value directly
+        default=DocumentStatus.UPLOADED,  # Use string value directly
         index=True,
         comment="Current processing status"
     )
@@ -217,7 +217,7 @@ class Document(Base):
         elif isinstance(self.status, str):
             return self.status
         else:
-            return DocumentStatus.UPLOADED.value
+            return DocumentStatus.UPLOADED
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert document to dictionary."""
@@ -250,7 +250,7 @@ class Document(Base):
         return {
             "id": str(self.id),
             "filename": self.filename,
-            "title": self.title,
+            "title": self.title, 
             "description": self.description,
             "file_size": self.file_size,
             "status": self._get_status_value(),
@@ -267,34 +267,34 @@ class Document(Base):
     def is_processed(self) -> bool:
         """Check if document has been successfully processed."""
         status_value = self._get_status_value()
-        return status_value == DocumentStatus.PROCESSED.value
+        return status_value == DocumentStatus.PROCESSED
     
     @property
     def is_processing(self) -> bool:
         """Check if document is currently being processed."""
         status_value = self._get_status_value()
-        return status_value == DocumentStatus.PROCESSING.value
+        return status_value == DocumentStatus.PROCESSING
     
     @property
     def has_error(self) -> bool:
         """Check if document processing failed."""
         status_value = self._get_status_value()
-        return status_value == DocumentStatus.FAILED.value
+        return status_value == DocumentStatus.FAILED
     
     def mark_processing_started(self):
         """Mark document as processing started."""
-        self.status = DocumentStatus.PROCESSING.value  # Use .value explicitly
+        self.status = DocumentStatus.PROCESSING  # Use .value explicitly
         self.processing_started_at = datetime.utcnow()
         self.processing_error = None
     
     def mark_processing_completed(self):
         """Mark document as processing completed."""
-        self.status = DocumentStatus.PROCESSED.value  # Use .value explicitly
+        self.status = DocumentStatus.PROCESSED  # Use .value explicitly
         self.processing_completed_at = datetime.utcnow()
         self.processing_error = None
     
     def mark_processing_failed(self, error_message: str):
         """Mark document as processing failed."""
-        self.status = DocumentStatus.FAILED.value  # Use .value explicitly
+        self.status = DocumentStatus.FAILED  # Use .value explicitly
         self.processing_completed_at = datetime.utcnow()
         self.processing_error = error_message

@@ -14,9 +14,9 @@ from pydantic import BaseModel
 
 from app.core.config import get_settings
 from app.core.database import async_engine
-from app.services.free_llm_service import free_llm_service, free_embedding_service
+from app.services.gemini_llm_service import improved_llm_service
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__) 
 settings = get_settings()
 
 router = APIRouter()
@@ -173,7 +173,7 @@ async def _check_llm_service() -> Dict[str, Any]:
     
     try:
         # Test LLM with a simple query
-        test_response = await free_llm_service.generate_response(
+        test_response = await improved_llm_service.generate_response(
             "Hello", 
             max_tokens=5
         )

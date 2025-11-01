@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     LLM_MODEL: str = Field(default="llama2")
     LLM_TEMPERATURE: float = Field(default=0.1)
     MAX_TOKENS: int = Field(default=2000)
+    
+    # GEMINI API - FIXED: Made optional with proper default
+    GEMINI_API_KEY: Optional[str] = Field(default=None, description="API key for Gemini")
 
     # Embeddings
     EMBEDDING_PROVIDER: str = Field(default="sentence-transformers")

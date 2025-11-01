@@ -226,7 +226,7 @@ const ChatInterface = () => {
           {messages.length === 0 ? (
             <div className="chat-welcome">
               <div className="chat-welcome__content">
-                <h2 className="chat-welcome__title">Welcome to Agentic PDF Sage</h2>
+                <h2 className="chat-welcome__title">Welcome to PDF Sage</h2>
                 <p className="chat-welcome__description">
                   Select documents and start asking questions to get intelligent, 
                   source-backed answers with transparent reasoning.

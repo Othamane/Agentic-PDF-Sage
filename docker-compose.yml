@@ -4,9 +4,9 @@ services:
   # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
-    container_name: agentic_pdf_sage_db
+    container_name: pdf_sage_db
     environment:
-      POSTGRES_DB: agentsage
+      POSTGRES_DB: pdfsage
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
@@ -23,52 +23,30 @@ services:
       timeout: 10s
       retries: 3
 
-# Ollama LLM Server (Free Local LLM)
-  ollama:
-    image: ollama/ollama:latest
-    container_name: agentic_pdf_sage_ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
-    networks:
-      - app-network
-    restart: unless-stopped
-    environment:
-      - OLLAMA_ORIGINS=*
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        reservations:
-          memory: 2G
-
   # Backend API
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: agentic_pdf_sage_backend
+    container_name: pdf_sage_backend
     environment:
-      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/agentsage
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/pdfsage
       FRONTEND_HOST: ${FRONTEND_HOST}
-      OLLAMA_HOST: ${OLLAMA_HOST}
       LLM_PROVIDER: ${LLM_PROVIDER}
       LLM_MODEL: ${LLM_MODEL}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      VECTOR_DIMENSION: ${VECTOR_DIMENSION}
       ENVIRONMENT: ${ENVIRONMENT}
       SECRET_KEY: ${SECRET_KEY}
+      DEBUG: ${DEBUG}
       HUGGINGFACE_TOKEN: ${HUGGINGFACE_TOKEN}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       CORS_ORIGINS: ${CORS_ORIGINS}
-      # Add other missing variables from your .env
-      DEBUG: ${DEBUG}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW}
       RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS}
       RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW}
       MAX_FILE_SIZE: ${MAX_FILE_SIZE}
@@ -79,6 +57,16 @@ services:
       CHUNK_OVERLAP: ${CHUNK_OVERLAP}
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_FILE: ${LOG_FILE}
+      MAX_SEARCH_RESULTS: ${MAX_SEARCH_RESULTS}
+      SEARCH_TIMEOUT_SECONDS: ${SEARCH_TIMEOUT_SECONDS}
+      DOCUMENT_PROCESSING_TIMEOUT: ${DOCUMENT_PROCESSING_TIMEOUT}
+      VECTOR_CREATION_TIMEOUT: ${VECTOR_CREATION_TIMEOUT}
+      LLM_GENERATION_TIMEOUT: ${LLM_GENERATION_TIMEOUT}
+      VECTOR_CACHE_SIZE: ${VECTOR_CACHE_SIZE}
+      VECTOR_CACHE_TTL: ${VECTOR_CACHE_TTL}
+      ENABLE_VECTOR_DEBUG: ${ENABLE_VECTOR_DEBUG}
+      ENABLE_LLM_DEBUG: ${ENABLE_LLM_DEBUG}
+      ENABLE_DB_DEBUG: ${ENABLE_DB_DEBUG}
     volumes:
       - ./backend/uploads:/app/uploads
       - ./backend/logs:/app/logs
@@ -86,8 +74,6 @@ services:
       - "8000:8000"
     depends_on:
       postgres:
-        condition: service_healthy
-      ollama:
         condition: service_healthy
     networks:
       - app-network
@@ -105,7 +91,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_BACKEND_URL: ${BACKEND_HOST:-http://localhost:8000}
-    container_name: agentic_pdf_sage_frontend
+    container_name: pdf_sage_frontend
     ports:
       - "3000:80"
     depends_on:
@@ -119,30 +105,8 @@ services:
       timeout: 10s
       retries: 3
 
-  # Initialize Ollama with models (run once)
-  ollama-init:
-    image: ollama/ollama:latest
-    container_name: ollama_init
-    depends_on:
-      ollama:
-        condition: service_healthy
-    networks:
-      - app-network
-    restart: "no"
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-    command: >
-      sh -c "
-        echo 'Pulling Llama2 model...' &&
-        ollama pull llama2 &&
-        echo 'Pulling Mistral model...' &&
-        ollama pull mistral &&
-        echo 'Models downloaded successfully!'
-      "
-
 volumes:
   postgres_data:
-  ollama_data:
 
 networks:
   app-network:
